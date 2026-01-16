@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::fmt::Debug;
+use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
@@ -156,6 +157,8 @@ use crate::tools::spec::ToolsConfigParams;
 use crate::turn_diff_tracker::TurnDiffTracker;
 use crate::unified_exec::UnifiedExecProcessManager;
 use crate::user_instructions::UserInstructions;
+use crate::user_notification::ApprovalContext;
+use crate::user_notification::ApprovalNotification;
 use crate::user_notification::UserNotification;
 use crate::util::backoff;
 use codex_async_utils::OrCancelExt;
@@ -1197,6 +1200,17 @@ impl Session {
         }
 
         let parsed_cmd = parse_command(&command);
+        let approval_context = self
+            .approval_context(turn_context, call_id.clone(), reason.clone(), &cwd)
+            .await;
+        let approval_notification = UserNotification::ApprovalRequested {
+            approval: ApprovalNotification::Exec {
+                context: approval_context,
+                command: command.clone(),
+                proposed_execpolicy_amendment: proposed_execpolicy_amendment.clone(),
+                parsed_cmd: parsed_cmd.clone(),
+            },
+        };
         let event = EventMsg::ExecApprovalRequest(ExecApprovalRequestEvent {
             call_id,
             turn_id: turn_context.sub_id.clone(),
@@ -1207,6 +1221,12 @@ impl Session {
             parsed_cmd,
         });
         self.send_event(turn_context, event).await;
+        if !matches!(
+            turn_context.client.get_session_source(),
+            SessionSource::SubAgent(_)
+        ) {
+            self.notifier().notify(&approval_notification);
+        }
         rx_approve.await.unwrap_or_default()
     }
 
@@ -1236,6 +1256,21 @@ impl Session {
             warn!("Overwriting existing pending approval for sub_id: {event_id}");
         }
 
+        let approval_context = self
+            .approval_context(
+                turn_context,
+                call_id.clone(),
+                reason.clone(),
+                &turn_context.cwd,
+            )
+            .await;
+        let approval_notification = UserNotification::ApprovalRequested {
+            approval: ApprovalNotification::ApplyPatch {
+                context: approval_context,
+                changes: changes.clone(),
+                grant_root: grant_root.clone(),
+            },
+        };
         let event = EventMsg::ApplyPatchApprovalRequest(ApplyPatchApprovalRequestEvent {
             call_id,
             turn_id: turn_context.sub_id.clone(),
@@ -1244,6 +1279,12 @@ impl Session {
             grant_root,
         });
         self.send_event(turn_context, event).await;
+        if !matches!(
+            turn_context.client.get_session_source(),
+            SessionSource::SubAgent(_)
+        ) {
+            self.notifier().notify(&approval_notification);
+        }
         rx_approve
     }
 
@@ -1537,6 +1578,7 @@ impl Session {
         // those spans, and `record_response_item_and_emit_turn_item` would drop them.
         self.record_conversation_items(turn_context, std::slice::from_ref(&response_item))
             .await;
+        self.update_turn_input_messages(turn_context, input).await;
         let turn_item = TurnItem::UserMessage(UserMessageItem::new(input));
         self.emit_turn_item_started(turn_context, &turn_item).await;
         self.emit_turn_item_completed(turn_context, turn_item).await;
@@ -1601,10 +1643,14 @@ impl Session {
 
     /// Returns the input if there was no task running to inject into
     pub async fn inject_input(&self, input: Vec<UserInput>) -> Result<(), Vec<UserInput>> {
+        let pending_message = Self::user_input_message(&input);
         let mut active = self.active_turn.lock().await;
         match active.as_mut() {
             Some(at) => {
                 let mut ts = at.turn_state.lock().await;
+                if let Some(message) = pending_message {
+                    ts.append_turn_input_message(message);
+                }
                 ts.push_pending_input(input.into());
                 Ok(())
             }
@@ -1622,6 +1668,9 @@ impl Session {
             Some(at) => {
                 let mut ts = at.turn_state.lock().await;
                 for item in input {
+                    if let Some(message) = Self::response_input_message(&item) {
+                        ts.append_turn_input_message(message);
+                    }
                     ts.push_pending_input(item);
                 }
                 Ok(())
@@ -1726,6 +1775,122 @@ impl Session {
 
     pub(crate) fn notifier(&self) -> &UserNotifier {
         &self.services.notifier
+    }
+
+    fn user_input_message(input: &[UserInput]) -> Option<String> {
+        if input.is_empty() {
+            return None;
+        }
+        let mut message = String::new();
+        for item in input {
+            if let UserInput::Text { text, .. } = item {
+                message.push_str(text);
+            }
+        }
+        Some(message)
+    }
+
+    fn response_input_message(input: &ResponseInputItem) -> Option<String> {
+        let ResponseInputItem::Message { role, content } = input else {
+            return None;
+        };
+        if role != "user" {
+            return None;
+        }
+        let mut message = String::new();
+        for item in content {
+            if let ContentItem::InputText { text } = item {
+                message.push_str(text);
+            }
+        }
+        Some(message)
+    }
+
+    async fn update_turn_input_messages(&self, turn_context: &TurnContext, input: &[UserInput]) {
+        let message = Self::user_input_message(input);
+        let turn_state = {
+            let active = self.active_turn.lock().await;
+            let Some(active_turn) = active.as_ref() else {
+                return;
+            };
+            if !active_turn.tasks.contains_key(&turn_context.sub_id) {
+                return;
+            }
+            Arc::clone(&active_turn.turn_state)
+        };
+        let mut state = turn_state.lock().await;
+        match message {
+            Some(message) => {
+                if state.has_turn_input_messages() {
+                    state.prepend_turn_input_message(message);
+                } else {
+                    state.set_turn_input_messages(vec![message]);
+                }
+            }
+            None => {
+                if !state.has_turn_input_messages() {
+                    state.set_turn_input_messages(Vec::new());
+                }
+            }
+        }
+    }
+
+    pub(crate) async fn update_turn_last_assistant_message(
+        &self,
+        turn_context: &TurnContext,
+        message: String,
+    ) {
+        let turn_state = {
+            let active = self.active_turn.lock().await;
+            let Some(active_turn) = active.as_ref() else {
+                return;
+            };
+            if !active_turn.tasks.contains_key(&turn_context.sub_id) {
+                return;
+            }
+            Arc::clone(&active_turn.turn_state)
+        };
+        let mut state = turn_state.lock().await;
+        state.set_last_assistant_message(message);
+    }
+
+    async fn turn_notification_context(
+        &self,
+        turn_context: &TurnContext,
+    ) -> (Vec<String>, Option<String>) {
+        let turn_state = {
+            let active = self.active_turn.lock().await;
+            let Some(active_turn) = active.as_ref() else {
+                return (Vec::new(), None);
+            };
+            if !active_turn.tasks.contains_key(&turn_context.sub_id) {
+                return (Vec::new(), None);
+            }
+            Arc::clone(&active_turn.turn_state)
+        };
+        let state = turn_state.lock().await;
+        (state.turn_input_messages(), state.last_assistant_message())
+    }
+
+    async fn approval_context(
+        &self,
+        turn_context: &TurnContext,
+        call_id: String,
+        reason: Option<String>,
+        cwd: &Path,
+    ) -> ApprovalContext {
+        let (input_messages, last_assistant_message) =
+            self.turn_notification_context(turn_context).await;
+
+        ApprovalContext {
+            thread_id: self.conversation_id.to_string(),
+            turn_id: turn_context.sub_id.clone(),
+            cwd: cwd.display().to_string(),
+            input_messages,
+            last_assistant_message,
+            call_id,
+            reason,
+        }
     }
 
     pub(crate) fn user_shell(&self) -> Arc<shell::Shell> {
@@ -2637,11 +2802,16 @@ pub(crate) async fn run_turn(
         {
             Ok(sampling_request_output) => {
                 let SamplingRequestResult {
-                    needs_follow_up,
+                    mut needs_follow_up,
                     last_agent_message: sampling_request_last_agent_message,
                 } = sampling_request_output;
                 let total_usage_tokens = sess.get_total_token_usage().await;
                 let token_limit_reached = total_usage_tokens >= auto_compact_limit;
+
+                // Pending input can arrive after the stream completes; re-check before ending.
+                if !needs_follow_up && sess.has_pending_input().await {
+                    needs_follow_up = true;
+                }
 
                 // as long as compaction works well in getting us way below the token limit, we shouldn't worry about being in an infinite loop.
                 if token_limit_reached && needs_follow_up {

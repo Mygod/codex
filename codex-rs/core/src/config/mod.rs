@@ -162,10 +162,10 @@ pub struct Config {
 
     /// Optional external notifier command. When set, Codex will spawn this
     /// program after each completed *turn* (i.e. when the agent finishes
-    /// processing a user submission). The value must be the full command
-    /// broken into argv tokens **without** the trailing JSON argument - Codex
-    /// appends one extra argument containing a JSON payload describing the
-    /// event.
+    /// processing a user submission) and when the agent pauses for user
+    /// approval. The value must be the full command broken into argv tokens
+    /// **without** the trailing JSON argument - Codex appends one extra
+    /// argument containing a JSON payload describing the event.
     ///
     /// Example `~/.codex/config.toml` snippet:
     ///
@@ -177,6 +177,7 @@ pub struct Config {
     ///
     /// ```shell
     /// notify-send Codex '{"type":"agent-turn-complete","turn-id":"12345"}'
+    /// notify-send Codex '{"type":"approval-requested","approval-kind":"exec","turn-id":"12345"}'
     /// ```
     ///
     /// If unset the feature is disabled.

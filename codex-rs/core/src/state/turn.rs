@@ -68,6 +68,8 @@ impl ActiveTurn {
 pub(crate) struct TurnState {
     pending_approvals: HashMap<String, oneshot::Sender<ReviewDecision>>,
     pending_input: Vec<ResponseInputItem>,
+    turn_input_messages: Vec<String>,
+    last_assistant_message: Option<String>,
 }
 
 impl TurnState {
@@ -89,6 +91,8 @@ impl TurnState {
     pub(crate) fn clear_pending(&mut self) {
         self.pending_approvals.clear();
         self.pending_input.clear();
+        self.turn_input_messages.clear();
+        self.last_assistant_message = None;
     }
 
     pub(crate) fn push_pending_input(&mut self, input: ResponseInputItem) {
@@ -107,6 +111,37 @@ impl TurnState {
 
     pub(crate) fn has_pending_input(&self) -> bool {
         !self.pending_input.is_empty()
+    }
+
+    pub(crate) fn set_turn_input_messages(&mut self, messages: Vec<String>) {
+        self.turn_input_messages = messages;
+        self.last_assistant_message = None;
+    }
+
+    pub(crate) fn append_turn_input_message(&mut self, message: String) {
+        self.turn_input_messages.push(message);
+        self.last_assistant_message = None;
+    }
+
+    pub(crate) fn prepend_turn_input_message(&mut self, message: String) {
+        self.turn_input_messages.insert(0, message);
+        self.last_assistant_message = None;
+    }
+
+    pub(crate) fn has_turn_input_messages(&self) -> bool {
+        !self.turn_input_messages.is_empty()
+    }
+
+    pub(crate) fn set_last_assistant_message(&mut self, message: String) {
+        self.last_assistant_message = Some(message);
+    }
+
+    pub(crate) fn turn_input_messages(&self) -> Vec<String> {
+        self.turn_input_messages.clone()
+    }
+
+    pub(crate) fn last_assistant_message(&self) -> Option<String> {
+        self.last_assistant_message.clone()
     }
 }
 

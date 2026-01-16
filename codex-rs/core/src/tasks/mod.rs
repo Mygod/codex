@@ -117,6 +117,8 @@ impl Session {
         let cancellation_token = CancellationToken::new();
         let done = Arc::new(Notify::new());
 
+        let start_gate = Arc::new(Notify::new());
+        let start_gate_wait = Arc::clone(&start_gate);
         let done_clone = Arc::clone(&done);
         let handle = {
             let session_ctx = Arc::new(SessionTaskContext::new(Arc::clone(self)));
@@ -124,6 +126,16 @@ impl Session {
             let task_for_run = Arc::clone(&task);
             let task_cancellation_token = cancellation_token.child_token();
             tokio::spawn(async move {
+                tokio::select! {
+                    _ = start_gate_wait.notified() => {}
+                    _ = task_cancellation_token.cancelled() => {}
+                }
+
+                if task_cancellation_token.is_cancelled() {
+                    done_clone.notify_waiters();
+                    return;
+                }
+
                 let ctx_for_finish = Arc::clone(&ctx);
                 let last_agent_message = task_for_run
                     .run(
@@ -153,6 +165,7 @@ impl Session {
             turn_context: Arc::clone(&turn_context),
         };
         self.register_new_active_task(running_task).await;
+        start_gate.notify_one();
     }
 
     pub async fn abort_all_tasks(self: &Arc<Self>, reason: TurnAbortReason) {

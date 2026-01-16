@@ -86,7 +86,12 @@ pub(crate) async fn handle_output_item_done(
                 .await;
             let last_agent_message = last_assistant_message_from_item(&item);
 
-            output.last_agent_message = last_agent_message;
+            if let Some(message) = last_agent_message {
+                ctx.sess
+                    .update_turn_last_assistant_message(&ctx.turn_context, message.clone())
+                    .await;
+                output.last_agent_message = Some(message);
+            }
         }
         // Guardrail: the model issued a LocalShellCall without an id; surface the error back into history.
         Err(FunctionCallError::MissingLocalShellCallId) => {

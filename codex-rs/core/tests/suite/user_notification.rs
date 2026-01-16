@@ -1,6 +1,7 @@
 #![cfg(not(target_os = "windows"))]
 
 use std::os::unix::fs::PermissionsExt;
+use std::path::Path;
 
 use codex_core::protocol::EventMsg;
 use codex_core::protocol::Op;
@@ -43,7 +44,7 @@ async fn summarize_context_three_requests_and_instructions() -> anyhow::Result<(
         &notify_script,
         r#"#!/bin/bash
 set -e
-echo -n "${@: -1}" > $(dirname "${0}")/notify.txt"#,
+printf '%s\n' "${@: -1}" >> $(dirname "${0}")/notify.txt"#,
     )?;
     std::fs::set_permissions(&notify_script, std::fs::Permissions::from_mode(0o755))?;
 
@@ -69,12 +70,39 @@ echo -n "${@: -1}" > $(dirname "${0}")/notify.txt"#,
 
     // We fork the notify script, so we need to wait for it to write to the file.
     fs_wait::wait_for_path_exists(&notify_file, Duration::from_secs(5)).await?;
-    let notify_payload_raw = tokio::fs::read_to_string(&notify_file).await?;
-    let payload: Value = serde_json::from_str(&notify_payload_raw)?;
+    let payload = wait_for_notification_payload(&notify_file, |payload| {
+        payload.get("type") == Some(&json!("agent-turn-complete"))
+    })
+    .await?;
 
     assert_eq!(payload["type"], json!("agent-turn-complete"));
     assert_eq!(payload["input-messages"], json!(["hello world"]));
     assert_eq!(payload["last-assistant-message"], json!("Done"));
 
     Ok(())
+}
+
+async fn wait_for_notification_payload(
+    path: &Path,
+    predicate: impl Fn(&Value) -> bool,
+) -> anyhow::Result<Value> {
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        if let Ok(raw) = tokio::fs::read_to_string(path).await
+            && let Some(payload) = raw
+                .lines()
+                .map(str::trim)
+                .filter(|line| !line.is_empty())
+                .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+                .find(|payload| predicate(payload))
+        {
+            return Ok(payload);
+        }
+
+        if std::time::Instant::now() >= deadline {
+            anyhow::bail!("timed out waiting for notify payload");
+        }
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
 }
