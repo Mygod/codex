@@ -57,8 +57,11 @@ use chrono::Local;
 use chrono::Utc;
 use codex_app_server_protocol::McpServerElicitationRequest;
 use codex_app_server_protocol::McpServerElicitationRequestParams;
+use codex_hooks::HookApprovalRequest;
 use codex_hooks::HookEvent;
 use codex_hooks::HookEventAfterAgent;
+use codex_hooks::HookEventAfterApprovalRequested;
+use codex_hooks::HookEventAfterInputRequested;
 use codex_hooks::HookPayload;
 use codex_hooks::HookResult;
 use codex_hooks::Hooks;
@@ -108,6 +111,7 @@ use codex_protocol::request_permissions::RequestPermissionsArgs;
 use codex_protocol::request_permissions::RequestPermissionsEvent;
 use codex_protocol::request_permissions::RequestPermissionsResponse;
 use codex_protocol::request_user_input::RequestUserInputArgs;
+use codex_protocol::request_user_input::RequestUserInputQuestion;
 use codex_protocol::request_user_input::RequestUserInputResponse;
 use codex_rmcp_client::ElicitationResponse;
 use codex_rmcp_client::OAuthCredentialsStoreMode;
@@ -276,6 +280,7 @@ use crate::skills::injection::app_id_from_path;
 use crate::skills::injection::tool_kind_for_path;
 use crate::skills::resolve_skill_dependencies_for_turn;
 use crate::state::ActiveTurn;
+use crate::state::NotifyContext;
 use crate::state::SessionServices;
 use crate::state::SessionState;
 use crate::state_db;
@@ -1579,6 +1584,12 @@ impl Session {
         let _ = hook_shell_argv.pop();
         let hooks = Hooks::new(HooksConfig {
             legacy_notify_argv: config.notify.clone(),
+            legacy_notify_events: config
+                .notify_events
+                .iter()
+                .copied()
+                .map(|event| event.as_hook_event_name().to_string())
+                .collect(),
             feature_enabled: config.features.enabled(Feature::CodexHooks),
             config_layer_stack: Some(config.config_layer_stack.clone()),
             shell_program: Some(hook_shell_program),
@@ -1592,7 +1603,10 @@ impl Session {
                 }),
             });
         }
-
+        let notify_context = Arc::new(RwLock::new(NotifyContext::new(
+            session_configuration.cwd.clone(),
+            session_configuration.app_server_client_name.clone(),
+        )));
         let services = SessionServices {
             // Initialize the MCP connection manager with an uninitialized
             // instance. It will be replaced with one created via
@@ -1614,7 +1628,7 @@ impl Session {
                 Arc::clone(&config),
                 Arc::clone(&auth_manager),
             ),
-            hooks,
+            hooks: hooks.clone(),
             rollout: Mutex::new(rollout_recorder),
             user_shell: Arc::new(default_shell),
             shell_snapshot_tx,
@@ -1633,6 +1647,7 @@ impl Session {
             network_proxy,
             network_approval: Arc::clone(&network_approval),
             state_db: state_db_ctx.clone(),
+            notify_context: Arc::clone(&notify_context),
             model_client: ModelClient::new(
                 Some(Arc::clone(&auth_manager)),
                 conversation_id,
@@ -1730,6 +1745,11 @@ impl Session {
             config.codex_home.clone(),
             codex_apps_tools_cache_key(auth),
             tool_plugin_provenance,
+            Some(crate::mcp_connection_manager::ElicitationHookContext {
+                session_id: conversation_id,
+                hooks,
+                notify_context,
+            }),
         )
         .await;
         {
@@ -2170,6 +2190,7 @@ impl Session {
             Ok(updated) => {
                 let previous_cwd = state.session_configuration.cwd.clone();
                 let next_cwd = updated.cwd.clone();
+                let next_client = updated.app_server_client_name.clone();
                 let codex_home = updated.codex_home.clone();
                 let session_source = updated.session_source.clone();
                 state.session_configuration = updated;
@@ -2181,6 +2202,11 @@ impl Session {
                     &codex_home,
                     &session_source,
                 );
+                {
+                    let mut notify_context = self.services.notify_context.write().await;
+                    notify_context.cwd = next_cwd;
+                    notify_context.client = next_client;
+                }
 
                 Ok(())
             }
@@ -2840,6 +2866,22 @@ impl Session {
                 additional_permissions.as_ref(),
             )
         });
+        let approval_hook_event = self
+            .approval_hook_event(
+                turn_context,
+                call_id.clone(),
+                reason.clone(),
+                HookApprovalRequest::Exec {
+                    command: command.clone(),
+                    proposed_execpolicy_amendment: proposed_execpolicy_amendment.clone(),
+                    proposed_network_policy_amendments: proposed_network_policy_amendments.clone(),
+                    additional_permissions: additional_permissions.clone(),
+                    parsed_cmd: parsed_cmd.clone(),
+                    network_approval_context: network_approval_context.clone(),
+                },
+            )
+            .await;
+        let approval_cwd = cwd.clone();
         let event = EventMsg::ExecApprovalRequest(ExecApprovalRequestEvent {
             call_id,
             approval_id,
@@ -2856,6 +2898,14 @@ impl Session {
             parsed_cmd,
         });
         self.send_event(turn_context, event).await;
+        self.dispatch_nonfatal_hook_event(
+            turn_context,
+            approval_cwd,
+            HookEvent::AfterApprovalRequested {
+                event: approval_hook_event,
+            },
+        )
+        .await;
         rx_approve.await.unwrap_or(ReviewDecision::Abort)
     }
 
@@ -2884,6 +2934,17 @@ impl Session {
             warn!("Overwriting existing pending approval for call_id: {approval_id}");
         }
 
+        let approval_hook_event = self
+            .approval_hook_event(
+                turn_context,
+                call_id.clone(),
+                reason.clone(),
+                HookApprovalRequest::ApplyPatch {
+                    changes: changes.clone(),
+                    grant_root: grant_root.clone(),
+                },
+            )
+            .await;
         let event = EventMsg::ApplyPatchApprovalRequest(ApplyPatchApprovalRequestEvent {
             call_id,
             turn_id: turn_context.sub_id.clone(),
@@ -2892,6 +2953,14 @@ impl Session {
             grant_root,
         });
         self.send_event(turn_context, event).await;
+        self.dispatch_nonfatal_hook_event(
+            turn_context,
+            turn_context.cwd.clone(),
+            HookEvent::AfterApprovalRequested {
+                event: approval_hook_event,
+            },
+        )
+        .await;
         rx_approve
     }
 
@@ -2970,12 +3039,24 @@ impl Session {
             warn!("Overwriting existing pending user input for sub_id: {event_id}");
         }
 
+        let questions = args.questions;
+        let input_hook_event = self
+            .input_hook_event(turn_context, call_id.clone(), questions.clone())
+            .await;
         let event = EventMsg::RequestUserInput(RequestUserInputEvent {
             call_id,
             turn_id: turn_context.sub_id.clone(),
-            questions: args.questions,
+            questions,
         });
         self.send_event(turn_context, event).await;
+        self.dispatch_nonfatal_hook_event(
+            turn_context,
+            turn_context.cwd.clone(),
+            HookEvent::AfterInputRequested {
+                event: input_hook_event,
+            },
+        )
+        .await;
         rx_response.await.ok()
     }
 
@@ -3651,6 +3732,12 @@ impl Session {
             self.emit_turn_item_started(turn_context, &item).await;
             self.emit_turn_item_completed(turn_context, item).await;
         }
+
+        let plan_mode = turn_context.collaboration_mode.mode == ModeKind::Plan;
+        if let Some(message) = last_assistant_message_from_item(&response_item, plan_mode) {
+            self.update_turn_last_assistant_message(turn_context, message)
+                .await;
+        }
     }
 
     pub(crate) async fn record_user_prompt_and_emit_turn_item(
@@ -3739,6 +3826,7 @@ impl Session {
             return Err(SteerInputError::EmptyInput);
         }
 
+        let pending_message = Self::user_input_message(&input);
         let mut active = self.active_turn.lock().await;
         let Some(active_turn) = active.as_mut() else {
             return Err(SteerInputError::NoActiveTurn(input));
@@ -3758,6 +3846,9 @@ impl Session {
         }
 
         let mut turn_state = active_turn.turn_state.lock().await;
+        if let Some(message) = pending_message {
+            self.append_turn_input_message(message).await;
+        }
         turn_state.push_pending_input(input.into());
         Ok(active_turn_id.clone())
     }
@@ -3772,6 +3863,9 @@ impl Session {
             Some(at) => {
                 let mut ts = at.turn_state.lock().await;
                 for item in input {
+                    if let Some(message) = Self::response_input_message(&item) {
+                        self.append_turn_input_message(message).await;
+                    }
                     ts.push_pending_input(item);
                 }
                 Ok(())
@@ -3874,6 +3968,190 @@ impl Session {
         }
     }
 
+    pub(crate) fn user_input_message(input: &[UserInput]) -> Option<String> {
+        if input.is_empty() {
+            return None;
+        }
+        let mut message = String::new();
+        for item in input {
+            if let UserInput::Text { text, .. } = item {
+                message.push_str(text);
+            }
+        }
+        Some(message)
+    }
+
+    fn response_input_message(input: &ResponseInputItem) -> Option<String> {
+        let ResponseInputItem::Message { role, content } = input else {
+            return None;
+        };
+        if role != "user" {
+            return None;
+        }
+        let mut message = String::new();
+        for item in content {
+            if let ContentItem::InputText { text } = item {
+                message.push_str(text);
+            }
+        }
+        Some(message)
+    }
+
+    pub(crate) async fn set_turn_notification_context(
+        &self,
+        turn_context: &TurnContext,
+        input: &[UserInput],
+    ) {
+        let mut notify_context = self.services.notify_context.write().await;
+        *notify_context = NotifyContext {
+            turn_id: Some(turn_context.sub_id.clone()),
+            cwd: turn_context.cwd.clone(),
+            client: turn_context.app_server_client_name.clone(),
+            input_messages: Self::user_input_message(input).into_iter().collect(),
+            last_assistant_message: None,
+        };
+    }
+
+    async fn append_turn_input_message(&self, message: String) {
+        let mut notify_context = self.services.notify_context.write().await;
+        if notify_context.turn_id.is_some() {
+            notify_context.input_messages.push(message);
+            notify_context.last_assistant_message = None;
+        }
+    }
+
+    pub(crate) async fn update_turn_last_assistant_message(
+        &self,
+        turn_context: &TurnContext,
+        message: String,
+    ) {
+        let mut notify_context = self.services.notify_context.write().await;
+        if notify_context.turn_id.as_deref() == Some(turn_context.sub_id.as_str()) {
+            notify_context.cwd = turn_context.cwd.clone();
+            notify_context.client = turn_context.app_server_client_name.clone();
+            notify_context.last_assistant_message = Some(message);
+        }
+    }
+
+    pub(crate) async fn clear_turn_notification_context(&self, turn_context: &TurnContext) {
+        let mut notify_context = self.services.notify_context.write().await;
+        notify_context.cwd = turn_context.cwd.clone();
+        notify_context.client = turn_context.app_server_client_name.clone();
+        if notify_context.turn_id.as_deref() == Some(turn_context.sub_id.as_str()) {
+            notify_context.turn_id = None;
+            notify_context.input_messages.clear();
+            notify_context.last_assistant_message = None;
+        }
+    }
+
+    async fn turn_notification_context(&self, turn_context: &TurnContext) -> NotifyContext {
+        let notify_context = self.services.notify_context.read().await;
+        if notify_context.turn_id.as_deref() == Some(turn_context.sub_id.as_str()) {
+            return notify_context.clone();
+        }
+
+        let mut fallback = NotifyContext::new(
+            turn_context.cwd.clone(),
+            turn_context.app_server_client_name.clone(),
+        );
+        fallback.turn_id = Some(turn_context.sub_id.clone());
+        fallback
+    }
+
+    async fn approval_hook_event(
+        &self,
+        turn_context: &TurnContext,
+        call_id: String,
+        reason: Option<String>,
+        approval: HookApprovalRequest,
+    ) -> HookEventAfterApprovalRequested {
+        let notify_context = self.turn_notification_context(turn_context).await;
+        HookEventAfterApprovalRequested {
+            thread_id: self.conversation_id,
+            turn_id: turn_context.sub_id.clone(),
+            call_id,
+            reason,
+            input_messages: notify_context.input_messages,
+            last_assistant_message: notify_context.last_assistant_message,
+            approval,
+        }
+    }
+
+    async fn input_hook_event(
+        &self,
+        turn_context: &TurnContext,
+        call_id: String,
+        questions: Vec<RequestUserInputQuestion>,
+    ) -> HookEventAfterInputRequested {
+        let notify_context = self.turn_notification_context(turn_context).await;
+        HookEventAfterInputRequested {
+            thread_id: self.conversation_id,
+            turn_id: turn_context.sub_id.clone(),
+            call_id,
+            input_messages: notify_context.input_messages,
+            last_assistant_message: notify_context.last_assistant_message,
+            questions,
+        }
+    }
+
+    pub(crate) async fn dispatch_nonfatal_hook_event(
+        &self,
+        turn_context: &TurnContext,
+        cwd: PathBuf,
+        hook_event: HookEvent,
+    ) {
+        if matches!(&turn_context.session_source, SessionSource::SubAgent(_)) {
+            return;
+        }
+
+        let outcomes = self
+            .hooks()
+            .dispatch(HookPayload {
+                session_id: self.conversation_id,
+                cwd,
+                client: turn_context.app_server_client_name.clone(),
+                triggered_at: Utc::now(),
+                hook_event,
+            })
+            .await;
+
+        for outcome in outcomes {
+            match outcome.result {
+                HookResult::Success => {}
+                HookResult::FailedContinue(error) | HookResult::FailedAbort(error) => {
+                    warn!(
+                        turn_id = %turn_context.sub_id,
+                        hook_name = %outcome.hook_name,
+                        error = %error,
+                        "notification hook failed; continuing"
+                    );
+                }
+            }
+        }
+    }
+
+    pub(crate) async fn dispatch_agent_turn_complete_notification(
+        &self,
+        turn_context: &TurnContext,
+        last_assistant_message: Option<String>,
+    ) {
+        let notify_context = self.turn_notification_context(turn_context).await;
+        self.dispatch_nonfatal_hook_event(
+            turn_context,
+            turn_context.cwd.clone(),
+            HookEvent::AfterAgent {
+                event: HookEventAfterAgent {
+                    thread_id: self.conversation_id,
+                    turn_id: turn_context.sub_id.clone(),
+                    input_messages: notify_context.input_messages,
+                    last_assistant_message: last_assistant_message
+                        .or(notify_context.last_assistant_message),
+                },
+            },
+        )
+        .await;
+    }
+
     pub(crate) fn hooks(&self) -> &Hooks {
         &self.services.hooks
     }
@@ -3937,6 +4215,11 @@ impl Session {
             config.codex_home.clone(),
             codex_apps_tools_cache_key(auth.as_ref()),
             tool_plugin_provenance,
+            Some(crate::mcp_connection_manager::ElicitationHookContext {
+                session_id: self.conversation_id,
+                hooks: self.hooks().clone(),
+                notify_context: Arc::clone(&self.services.notify_context),
+            }),
         )
         .await;
         {
@@ -5739,23 +6022,27 @@ pub(crate) async fn run_turn(
                     if stop_outcome.should_stop {
                         break;
                     }
-                    let hook_outcomes = sess
-                        .hooks()
-                        .dispatch(HookPayload {
-                            session_id: sess.conversation_id,
-                            cwd: turn_context.cwd.clone(),
-                            client: turn_context.app_server_client_name.clone(),
-                            triggered_at: chrono::Utc::now(),
-                            hook_event: HookEvent::AfterAgent {
-                                event: HookEventAfterAgent {
-                                    thread_id: sess.conversation_id,
-                                    turn_id: turn_context.sub_id.clone(),
-                                    input_messages: sampling_request_input_messages,
-                                    last_assistant_message: last_agent_message.clone(),
-                                },
-                            },
-                        })
-                        .await;
+                    let hook_outcomes =
+                        if matches!(&turn_context.session_source, SessionSource::SubAgent(_)) {
+                            Vec::new()
+                        } else {
+                            sess.hooks()
+                                .dispatch(HookPayload {
+                                    session_id: sess.conversation_id,
+                                    cwd: turn_context.cwd.clone(),
+                                    client: turn_context.app_server_client_name.clone(),
+                                    triggered_at: Utc::now(),
+                                    hook_event: HookEvent::AfterAgent {
+                                        event: HookEventAfterAgent {
+                                            thread_id: sess.conversation_id,
+                                            turn_id: turn_context.sub_id.clone(),
+                                            input_messages: sampling_request_input_messages,
+                                            last_assistant_message: last_agent_message.clone(),
+                                        },
+                                    },
+                                })
+                                .await
+                        };
 
                     let mut abort_message = None;
                     for hook_outcome in hook_outcomes {

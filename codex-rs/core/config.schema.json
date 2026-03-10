@@ -949,6 +949,16 @@
         }
       ]
     },
+    "NotifyEvent": {
+      "enum": [
+        "agent-turn-complete",
+        "exec-approval-requested",
+        "apply-patch-approval-requested",
+        "input-requested",
+        "elicitation-requested"
+      ],
+      "type": "string"
+    },
     "OAuthCredentialsStoreMode": {
       "description": "Determine where Codex should store and read MCP credentials.",
       "oneOf": [
@@ -2168,6 +2178,14 @@
       "description": "Optional external command to spawn for end-user notifications.",
       "items": {
         "type": "string"
+      },
+      "type": "array"
+    },
+    "notify_events": {
+      "default": null,
+      "description": "Controls which notify events trigger the external notifier command.",
+      "items": {
+        "$ref": "#/definitions/NotifyEvent"
       },
       "type": "array"
     },

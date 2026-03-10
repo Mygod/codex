@@ -5,7 +5,15 @@ use chrono::DateTime;
 use chrono::SecondsFormat;
 use chrono::Utc;
 use codex_protocol::ThreadId;
+use codex_protocol::approvals::ExecPolicyAmendment;
+use codex_protocol::approvals::NetworkApprovalContext;
+use codex_protocol::approvals::NetworkPolicyAmendment;
+use codex_protocol::mcp::RequestId;
+use codex_protocol::models::PermissionProfile;
 use codex_protocol::models::SandboxPermissions;
+use codex_protocol::parse_command::ParsedCommand;
+use codex_protocol::protocol::FileChange;
+use codex_protocol::request_user_input::RequestUserInputQuestion;
 use futures::future::BoxFuture;
 use serde::Serialize;
 use serde::Serializer;
@@ -137,6 +145,57 @@ pub struct HookEventAfterToolUse {
     pub output_preview: String,
 }
 
+#[derive(Debug, Clone, Serialize, PartialEq)]
+#[serde(tag = "approval_kind", rename_all = "snake_case")]
+pub enum HookApprovalRequest {
+    Exec {
+        command: Vec<String>,
+        proposed_execpolicy_amendment: Option<ExecPolicyAmendment>,
+        proposed_network_policy_amendments: Option<Vec<NetworkPolicyAmendment>>,
+        additional_permissions: Option<PermissionProfile>,
+        parsed_cmd: Vec<ParsedCommand>,
+        network_approval_context: Option<NetworkApprovalContext>,
+    },
+    ApplyPatch {
+        changes: std::collections::HashMap<PathBuf, FileChange>,
+        grant_root: Option<PathBuf>,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub struct HookEventAfterApprovalRequested {
+    pub thread_id: ThreadId,
+    pub turn_id: String,
+    pub call_id: String,
+    pub reason: Option<String>,
+    pub input_messages: Vec<String>,
+    pub last_assistant_message: Option<String>,
+    #[serde(flatten)]
+    pub approval: HookApprovalRequest,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub struct HookEventAfterInputRequested {
+    pub thread_id: ThreadId,
+    pub turn_id: String,
+    pub call_id: String,
+    pub input_messages: Vec<String>,
+    pub last_assistant_message: Option<String>,
+    pub questions: Vec<RequestUserInputQuestion>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub struct HookEventAfterElicitationRequested {
+    pub thread_id: ThreadId,
+    pub turn_id: Option<String>,
+    pub server_name: String,
+    pub request_id: RequestId,
+    pub message: String,
+}
+
 fn serialize_triggered_at<S>(value: &DateTime<Utc>, serializer: S) -> Result<S::Ok, S::Error>
 where
     S: Serializer,
@@ -155,21 +214,50 @@ pub enum HookEvent {
         #[serde(flatten)]
         event: HookEventAfterToolUse,
     },
+    AfterApprovalRequested {
+        #[serde(flatten)]
+        event: HookEventAfterApprovalRequested,
+    },
+    AfterInputRequested {
+        #[serde(flatten)]
+        event: HookEventAfterInputRequested,
+    },
+    AfterElicitationRequested {
+        #[serde(flatten)]
+        event: HookEventAfterElicitationRequested,
+    },
 }
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
     use std::path::PathBuf;
 
     use chrono::TimeZone;
     use chrono::Utc;
     use codex_protocol::ThreadId;
+    use codex_protocol::approvals::ExecPolicyAmendment;
+    use codex_protocol::approvals::NetworkApprovalContext;
+    use codex_protocol::approvals::NetworkApprovalProtocol;
+    use codex_protocol::approvals::NetworkPolicyAmendment;
+    use codex_protocol::approvals::NetworkPolicyRuleAction;
+    use codex_protocol::mcp::RequestId;
+    use codex_protocol::models::FileSystemPermissions;
+    use codex_protocol::models::PermissionProfile;
     use codex_protocol::models::SandboxPermissions;
+    use codex_protocol::parse_command::ParsedCommand;
+    use codex_protocol::protocol::FileChange;
+    use codex_protocol::request_user_input::RequestUserInputQuestion;
+    use codex_protocol::request_user_input::RequestUserInputQuestionOption;
     use pretty_assertions::assert_eq;
     use serde_json::json;
 
+    use super::HookApprovalRequest;
     use super::HookEvent;
     use super::HookEventAfterAgent;
+    use super::HookEventAfterApprovalRequested;
+    use super::HookEventAfterElicitationRequested;
+    use super::HookEventAfterInputRequested;
     use super::HookEventAfterToolUse;
     use super::HookPayload;
     use super::HookToolInput;
@@ -286,5 +374,232 @@ mod tests {
         });
 
         assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn approval_requested_payload_serializes_stable_wire_shape() {
+        let session_id = ThreadId::new();
+        let thread_id = ThreadId::new();
+        let mut changes = HashMap::new();
+        changes.insert(
+            PathBuf::from("src/main.rs"),
+            FileChange::Add {
+                content: "fn main() {}".to_string(),
+            },
+        );
+        let payload = HookPayload {
+            session_id,
+            cwd: PathBuf::from("tmp"),
+            client: Some("codex-tui".to_string()),
+            triggered_at: Utc
+                .with_ymd_and_hms(2025, 1, 1, 0, 0, 0)
+                .single()
+                .expect("valid timestamp"),
+            hook_event: HookEvent::AfterApprovalRequested {
+                event: HookEventAfterApprovalRequested {
+                    thread_id,
+                    turn_id: "turn-3".to_string(),
+                    call_id: "call-2".to_string(),
+                    reason: Some("approval needed".to_string()),
+                    input_messages: vec!["please patch the file".to_string()],
+                    last_assistant_message: Some("Preparing patch.".to_string()),
+                    approval: HookApprovalRequest::ApplyPatch {
+                        changes,
+                        grant_root: Some(PathBuf::from("src")),
+                    },
+                },
+            },
+        };
+
+        let actual = serde_json::to_value(payload).expect("serialize hook payload");
+        let expected = json!({
+            "session_id": session_id.to_string(),
+            "cwd": "tmp",
+            "client": "codex-tui",
+            "triggered_at": "2025-01-01T00:00:00Z",
+            "hook_event": {
+                "event_type": "after_approval_requested",
+                "thread_id": thread_id.to_string(),
+                "turn_id": "turn-3",
+                "call_id": "call-2",
+                "reason": "approval needed",
+                "input_messages": ["please patch the file"],
+                "last_assistant_message": "Preparing patch.",
+                "approval_kind": "apply_patch",
+                "changes": {
+                    "src/main.rs": {
+                        "type": "add",
+                        "content": "fn main() {}"
+                    }
+                },
+                "grant_root": "src",
+            },
+        });
+
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn input_requested_payload_serializes_stable_wire_shape() {
+        let session_id = ThreadId::new();
+        let thread_id = ThreadId::new();
+        let payload = HookPayload {
+            session_id,
+            cwd: PathBuf::from("tmp"),
+            client: None,
+            triggered_at: Utc
+                .with_ymd_and_hms(2025, 1, 1, 0, 0, 0)
+                .single()
+                .expect("valid timestamp"),
+            hook_event: HookEvent::AfterInputRequested {
+                event: HookEventAfterInputRequested {
+                    thread_id,
+                    turn_id: "turn-4".to_string(),
+                    call_id: "call-3".to_string(),
+                    input_messages: vec!["Need a decision".to_string()],
+                    last_assistant_message: Some("Choose an option.".to_string()),
+                    questions: vec![RequestUserInputQuestion {
+                        id: "confirm".to_string(),
+                        header: "Confirm".to_string(),
+                        question: "Proceed?".to_string(),
+                        is_other: false,
+                        is_secret: false,
+                        options: Some(vec![RequestUserInputQuestionOption {
+                            label: "Yes".to_string(),
+                            description: "Continue.".to_string(),
+                        }]),
+                    }],
+                },
+            },
+        };
+
+        let actual = serde_json::to_value(payload).expect("serialize hook payload");
+        let expected = json!({
+            "session_id": session_id.to_string(),
+            "cwd": "tmp",
+            "triggered_at": "2025-01-01T00:00:00Z",
+            "hook_event": {
+                "event_type": "after_input_requested",
+                "thread_id": thread_id.to_string(),
+                "turn_id": "turn-4",
+                "call_id": "call-3",
+                "input_messages": ["Need a decision"],
+                "last_assistant_message": "Choose an option.",
+                "questions": [{
+                    "id": "confirm",
+                    "header": "Confirm",
+                    "question": "Proceed?",
+                    "isOther": false,
+                    "isSecret": false,
+                    "options": [{
+                        "label": "Yes",
+                        "description": "Continue."
+                    }]
+                }],
+            },
+        });
+
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn elicitation_requested_payload_serializes_stable_wire_shape() {
+        let session_id = ThreadId::new();
+        let thread_id = ThreadId::new();
+        let payload = HookPayload {
+            session_id,
+            cwd: PathBuf::from("tmp"),
+            client: Some("codex-app-server".to_string()),
+            triggered_at: Utc
+                .with_ymd_and_hms(2025, 1, 1, 0, 0, 0)
+                .single()
+                .expect("valid timestamp"),
+            hook_event: HookEvent::AfterElicitationRequested {
+                event: HookEventAfterElicitationRequested {
+                    thread_id,
+                    turn_id: Some("turn-5".to_string()),
+                    server_name: "calendar".to_string(),
+                    request_id: RequestId::Integer(7),
+                    message: "Open the OAuth URL".to_string(),
+                },
+            },
+        };
+
+        let actual = serde_json::to_value(payload).expect("serialize hook payload");
+        let expected = json!({
+            "session_id": session_id.to_string(),
+            "cwd": "tmp",
+            "client": "codex-app-server",
+            "triggered_at": "2025-01-01T00:00:00Z",
+            "hook_event": {
+                "event_type": "after_elicitation_requested",
+                "thread_id": thread_id.to_string(),
+                "turn_id": "turn-5",
+                "server_name": "calendar",
+                "request_id": 7,
+                "message": "Open the OAuth URL",
+            },
+        });
+
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn exec_approval_payload_serializes_additional_permissions() {
+        let session_id = ThreadId::new();
+        let thread_id = ThreadId::new();
+        let payload = HookPayload {
+            session_id,
+            cwd: PathBuf::from("tmp"),
+            client: None,
+            triggered_at: Utc
+                .with_ymd_and_hms(2025, 1, 1, 0, 0, 0)
+                .single()
+                .expect("valid timestamp"),
+            hook_event: HookEvent::AfterApprovalRequested {
+                event: HookEventAfterApprovalRequested {
+                    thread_id,
+                    turn_id: "turn-6".to_string(),
+                    call_id: "call-4".to_string(),
+                    reason: Some("Need extra access".to_string()),
+                    input_messages: vec!["Run the command".to_string()],
+                    last_assistant_message: None,
+                    approval: HookApprovalRequest::Exec {
+                        command: vec![
+                            "python3".to_string(),
+                            "-c".to_string(),
+                            "print(1)".to_string(),
+                        ],
+                        proposed_execpolicy_amendment: Some(ExecPolicyAmendment::new(vec![
+                            "python3".to_string(),
+                        ])),
+                        proposed_network_policy_amendments: Some(vec![NetworkPolicyAmendment {
+                            host: "example.com".to_string(),
+                            action: NetworkPolicyRuleAction::Allow,
+                        }]),
+                        additional_permissions: Some(PermissionProfile {
+                            file_system: Some(FileSystemPermissions {
+                                read: None,
+                                write: Some(vec![]),
+                            }),
+                            ..Default::default()
+                        }),
+                        parsed_cmd: vec![ParsedCommand::Unknown {
+                            cmd: "python3 -c print(1)".to_string(),
+                        }],
+                        network_approval_context: Some(NetworkApprovalContext {
+                            host: "example.com".to_string(),
+                            protocol: NetworkApprovalProtocol::Https,
+                        }),
+                    },
+                },
+            },
+        };
+
+        let actual = serde_json::to_value(payload).expect("serialize hook payload");
+        assert_eq!(
+            actual["hook_event"]["additional_permissions"]["file_system"]["write"],
+            json!([])
+        );
     }
 }

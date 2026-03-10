@@ -28,6 +28,27 @@ use tokio::sync::RwLock;
 use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 
+#[derive(Debug, Clone)]
+pub(crate) struct NotifyContext {
+    pub(crate) turn_id: Option<String>,
+    pub(crate) cwd: PathBuf,
+    pub(crate) client: Option<String>,
+    pub(crate) input_messages: Vec<String>,
+    pub(crate) last_assistant_message: Option<String>,
+}
+
+impl NotifyContext {
+    pub(crate) fn new(cwd: PathBuf, client: Option<String>) -> Self {
+        Self {
+            turn_id: None,
+            cwd,
+            client,
+            input_messages: Vec::new(),
+            last_assistant_message: None,
+        }
+    }
+}
+
 pub(crate) struct SessionServices {
     pub(crate) mcp_connection_manager: Arc<RwLock<McpConnectionManager>>,
     pub(crate) mcp_startup_cancellation_token: Mutex<CancellationToken>,
@@ -57,6 +78,7 @@ pub(crate) struct SessionServices {
     pub(crate) network_proxy: Option<StartedNetworkProxy>,
     pub(crate) network_approval: Arc<NetworkApprovalService>,
     pub(crate) state_db: Option<StateDbHandle>,
+    pub(crate) notify_context: Arc<RwLock<NotifyContext>>,
     /// Session-scoped model client shared across turns.
     pub(crate) model_client: ModelClient,
 }

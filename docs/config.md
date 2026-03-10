@@ -20,7 +20,10 @@ and are labeled as connected; others are marked as can be installed.
 
 ## Notify
 
-Codex can run a notification hook when the agent finishes a turn. See the configuration reference for the latest notification settings:
+Codex can run a notification hook when the agent finishes a turn. The default
+behavior still only emits `agent-turn-complete`; approval, `request_user_input`,
+and MCP elicitation notifications are opt-in via `notify_events`. See the
+configuration reference for the latest notification settings:
 
 - https://developers.openai.com/codex/config-reference
 

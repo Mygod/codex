@@ -264,6 +264,9 @@ pub(crate) async fn exit_review_mode(
             },
         )
         .await;
+    session
+        .dispatch_agent_turn_complete_notification(ctx.as_ref(), None)
+        .await;
 
     // Review turns can run before any regular user turn, so explicitly
     // materialize rollout persistence. Do this after emitting review output so

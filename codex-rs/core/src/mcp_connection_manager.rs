@@ -22,6 +22,7 @@ use std::time::Instant;
 use crate::mcp::CODEX_APPS_MCP_SERVER_NAME;
 use crate::mcp::ToolPluginProvenance;
 use crate::mcp::auth::McpAuthStatusEntry;
+use crate::state::NotifyContext;
 use anyhow::Context;
 use anyhow::Result;
 use anyhow::anyhow;
@@ -29,6 +30,11 @@ use async_channel::Sender;
 use codex_async_utils::CancelErr;
 use codex_async_utils::OrCancelExt;
 use codex_config::Constrained;
+use codex_hooks::HookEvent;
+use codex_hooks::HookEventAfterElicitationRequested;
+use codex_hooks::HookPayload;
+use codex_hooks::Hooks;
+use codex_protocol::ThreadId;
 use codex_protocol::approvals::ElicitationRequest;
 use codex_protocol::approvals::ElicitationRequestEvent;
 use codex_protocol::mcp::CallToolResult;
@@ -71,6 +77,7 @@ use serde::Serialize;
 use sha1::Digest;
 use sha1::Sha1;
 use tokio::sync::Mutex;
+use tokio::sync::RwLock;
 use tokio::sync::oneshot;
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
@@ -251,6 +258,13 @@ fn elicitation_is_rejected_by_policy(approval_policy: AskForApproval) -> bool {
 }
 
 #[derive(Clone)]
+pub(crate) struct ElicitationHookContext {
+    pub(crate) session_id: ThreadId,
+    pub(crate) hooks: Hooks,
+    pub(crate) notify_context: Arc<RwLock<NotifyContext>>,
+}
+
+#[derive(Clone)]
 struct ElicitationRequestManager {
     requests: Arc<Mutex<ResponderMap>>,
     approval_policy: Arc<StdMutex<AskForApproval>>,
@@ -279,7 +293,12 @@ impl ElicitationRequestManager {
             .map_err(|e| anyhow!("failed to send elicitation response: {e:?}"))
     }
 
-    fn make_sender(&self, server_name: String, tx_event: Sender<Event>) -> SendElicitation {
+    fn make_sender(
+        &self,
+        server_name: String,
+        tx_event: Sender<Event>,
+        hook_context: Option<ElicitationHookContext>,
+    ) -> SendElicitation {
         let elicitation_requests = self.requests.clone();
         let approval_policy = self.approval_policy.clone();
         Box::new(move |id, elicitation| {
@@ -287,6 +306,7 @@ impl ElicitationRequestManager {
             let tx_event = tx_event.clone();
             let server_name = server_name.clone();
             let approval_policy = approval_policy.clone();
+            let hook_context = hook_context.clone();
             async move {
                 if approval_policy
                     .lock()
@@ -333,24 +353,45 @@ impl ElicitationRequestManager {
                     let mut lock = elicitation_requests.lock().await;
                     lock.insert((server_name.clone(), id.clone()), tx);
                 }
+                let request_id = match id.clone() {
+                    rmcp::model::NumberOrString::String(value) => {
+                        ProtocolRequestId::String(value.to_string())
+                    }
+                    rmcp::model::NumberOrString::Number(value) => ProtocolRequestId::Integer(value),
+                };
+                let request_message = request.message().to_string();
                 let _ = tx_event
                     .send(Event {
                         id: "mcp_elicitation_request".to_string(),
                         msg: EventMsg::ElicitationRequest(ElicitationRequestEvent {
                             turn_id: None,
-                            server_name,
-                            id: match id.clone() {
-                                rmcp::model::NumberOrString::String(value) => {
-                                    ProtocolRequestId::String(value.to_string())
-                                }
-                                rmcp::model::NumberOrString::Number(value) => {
-                                    ProtocolRequestId::Integer(value)
-                                }
-                            },
+                            server_name: server_name.clone(),
+                            id: request_id.clone(),
                             request,
                         }),
                     })
                     .await;
+                if let Some(hook_context) = hook_context {
+                    let notify_context = hook_context.notify_context.read().await.clone();
+                    let _ = hook_context
+                        .hooks
+                        .dispatch(HookPayload {
+                            session_id: hook_context.session_id,
+                            cwd: notify_context.cwd,
+                            client: notify_context.client,
+                            triggered_at: chrono::Utc::now(),
+                            hook_event: HookEvent::AfterElicitationRequested {
+                                event: HookEventAfterElicitationRequested {
+                                    thread_id: hook_context.session_id,
+                                    turn_id: notify_context.turn_id,
+                                    server_name,
+                                    request_id,
+                                    message: request_message,
+                                },
+                            },
+                        })
+                        .await;
+                }
                 rx.await
                     .context("elicitation request channel closed unexpectedly")
             }
@@ -431,6 +472,7 @@ impl AsyncManagedClient {
         cancel_token: CancellationToken,
         tx_event: Sender<Event>,
         elicitation_requests: ElicitationRequestManager,
+        elicitation_hook_context: Option<ElicitationHookContext>,
         codex_apps_tools_cache_context: Option<CodexAppsToolsCacheContext>,
         tool_plugin_provenance: Arc<ToolPluginProvenance>,
     ) -> Self {
@@ -462,6 +504,7 @@ impl AsyncManagedClient {
                         tool_filter: startup_tool_filter,
                         tx_event,
                         elicitation_requests,
+                        elicitation_hook_context,
                         codex_apps_tools_cache_context,
                     },
                 )
@@ -634,6 +677,7 @@ impl McpConnectionManager {
         codex_home: PathBuf,
         codex_apps_tools_cache_key: CodexAppsToolsCacheKey,
         tool_plugin_provenance: ToolPluginProvenance,
+        elicitation_hook_context: Option<ElicitationHookContext>,
     ) -> (Self, CancellationToken) {
         let cancel_token = CancellationToken::new();
         let mut clients = HashMap::new();
@@ -670,6 +714,7 @@ impl McpConnectionManager {
                 cancel_token.clone(),
                 tx_event.clone(),
                 elicitation_requests.clone(),
+                elicitation_hook_context.clone(),
                 codex_apps_tools_cache_context,
                 Arc::clone(&tool_plugin_provenance),
             );
@@ -1316,6 +1361,7 @@ async fn start_server_task(
         tool_filter,
         tx_event,
         elicitation_requests,
+        elicitation_hook_context,
         codex_apps_tools_cache_context,
     } = params;
     let elicitation = elicitation_capability_for_server(&server_name);
@@ -1340,7 +1386,8 @@ async fn start_server_task(
         protocol_version: ProtocolVersion::V_2025_06_18,
     };
 
-    let send_elicitation = elicitation_requests.make_sender(server_name.clone(), tx_event);
+    let send_elicitation =
+        elicitation_requests.make_sender(server_name.clone(), tx_event, elicitation_hook_context);
 
     let initialize_result = client
         .initialize(params, startup_timeout, send_elicitation)
@@ -1395,6 +1442,7 @@ struct StartServerTaskParams {
     tool_filter: ToolFilter,
     tx_event: Sender<Event>,
     elicitation_requests: ElicitationRequestManager,
+    elicitation_hook_context: Option<ElicitationHookContext>,
     codex_apps_tools_cache_context: Option<CodexAppsToolsCacheContext>,
 }
 

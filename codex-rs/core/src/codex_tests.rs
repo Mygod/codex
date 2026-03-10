@@ -42,6 +42,7 @@ use crate::protocol::UserMessageEvent;
 use crate::rollout::policy::EventPersistenceMode;
 use crate::rollout::recorder::RolloutRecorder;
 use crate::rollout::recorder::RolloutRecorderParams;
+use crate::state::NotifyContext;
 use crate::state::TaskKind;
 use crate::tasks::SessionTask;
 use crate::tasks::SessionTaskContext;
@@ -2205,6 +2206,10 @@ pub(crate) async fn make_session_and_context() -> (Session, TurnContext) {
         network_proxy: None,
         network_approval: Arc::clone(&network_approval),
         state_db: None,
+        notify_context: Arc::new(RwLock::new(NotifyContext::new(
+            session_configuration.cwd.clone(),
+            session_configuration.app_server_client_name.clone(),
+        ))),
         model_client: ModelClient::new(
             Some(auth_manager.clone()),
             conversation_id,
@@ -2762,6 +2767,10 @@ pub(crate) async fn make_session_and_context_with_dynamic_tools_and_rx(
         network_proxy: None,
         network_approval: Arc::clone(&network_approval),
         state_db: None,
+        notify_context: Arc::new(RwLock::new(NotifyContext::new(
+            session_configuration.cwd.clone(),
+            session_configuration.app_server_client_name.clone(),
+        ))),
         model_client: ModelClient::new(
             Some(Arc::clone(&auth_manager)),
             conversation_id,

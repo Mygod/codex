@@ -643,6 +643,32 @@ impl Default for OtelConfig {
     }
 }
 
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, JsonSchema)]
+#[serde(rename_all = "kebab-case")]
+pub enum NotifyEvent {
+    AgentTurnComplete,
+    ExecApprovalRequested,
+    ApplyPatchApprovalRequested,
+    InputRequested,
+    ElicitationRequested,
+}
+
+impl NotifyEvent {
+    pub fn as_hook_event_name(self) -> &'static str {
+        match self {
+            NotifyEvent::AgentTurnComplete => "agent-turn-complete",
+            NotifyEvent::ExecApprovalRequested => "exec-approval-requested",
+            NotifyEvent::ApplyPatchApprovalRequested => "apply-patch-approval-requested",
+            NotifyEvent::InputRequested => "input-requested",
+            NotifyEvent::ElicitationRequested => "elicitation-requested",
+        }
+    }
+}
+
+pub fn default_notify_events() -> Vec<NotifyEvent> {
+    vec![NotifyEvent::AgentTurnComplete]
+}
+
 #[derive(Serialize, Debug, Clone, PartialEq, Eq, Deserialize, JsonSchema)]
 #[serde(untagged)]
 pub enum Notifications {

@@ -132,6 +132,8 @@ impl Session {
     ) {
         self.abort_all_tasks(TurnAbortReason::Replaced).await;
         self.clear_connector_selection().await;
+        self.set_turn_notification_context(turn_context.as_ref(), &input)
+            .await;
 
         let task: Arc<dyn SessionTask> = Arc::new(task);
         let task_kind = task.kind();
@@ -244,6 +246,8 @@ impl Session {
             *active = None;
         }
         drop(active);
+        self.clear_turn_notification_context(turn_context.as_ref())
+            .await;
         if !pending_input.is_empty() {
             let pending_response_items = pending_input
                 .into_iter()
@@ -384,6 +388,8 @@ impl Session {
         }
 
         task.handle.abort();
+        self.clear_turn_notification_context(task.turn_context.as_ref())
+            .await;
 
         let session_ctx = Arc::new(SessionTaskContext::new(Arc::clone(self)));
         session_task

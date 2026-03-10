@@ -13,6 +13,7 @@ use crate::config::types::ModelAvailabilityNuxConfig;
 use crate::config::types::Notice;
 use crate::config::types::NotificationMethod;
 use crate::config::types::Notifications;
+use crate::config::types::NotifyEvent;
 use crate::config::types::OtelConfig;
 use crate::config::types::OtelConfigToml;
 use crate::config::types::OtelExporterKind;
@@ -25,6 +26,7 @@ use crate::config::types::Tui;
 use crate::config::types::UriBasedFileOpener;
 use crate::config::types::WindowsSandboxModeToml;
 use crate::config::types::WindowsToml;
+use crate::config::types::default_notify_events;
 use crate::config_loader::CloudRequirementsLoader;
 use crate::config_loader::ConfigLayerStack;
 use crate::config_loader::ConfigLayerStackOrdering;
@@ -284,6 +286,12 @@ pub struct Config {
     ///
     /// If unset the feature is disabled.
     pub notify: Option<Vec<String>>,
+
+    /// Controls which notify events trigger the external notifier command.
+    ///
+    /// Defaults to `["agent-turn-complete"]`, preserving the current notify
+    /// behavior unless users opt into additional pause notifications.
+    pub notify_events: Vec<NotifyEvent>,
 
     /// TUI notifications preference. When set, the TUI will send terminal notifications on
     /// approvals and turn completions when not focused.
@@ -1078,6 +1086,10 @@ pub struct ConfigToml {
     /// Optional external command to spawn for end-user notifications.
     #[serde(default)]
     pub notify: Option<Vec<String>>,
+
+    /// Controls which notify events trigger the external notifier command.
+    #[serde(default)]
+    pub notify_events: Option<Vec<NotifyEvent>>,
 
     /// System instructions.
     pub instructions: Option<String>,
@@ -2370,6 +2382,7 @@ impl Config {
             },
             enforce_residency: enforce_residency.value,
             notify: cfg.notify,
+            notify_events: cfg.notify_events.unwrap_or_else(default_notify_events),
             user_instructions,
             base_instructions,
             personality,

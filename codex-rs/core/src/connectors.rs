@@ -169,6 +169,7 @@ pub async fn list_accessible_connectors_from_mcp_tools_with_options_and_status(
         config.codex_home.clone(),
         codex_apps_tools_cache_key(auth.as_ref()),
         ToolPluginProvenance::default(),
+        None,
     )
     .await;
 
