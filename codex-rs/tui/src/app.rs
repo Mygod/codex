@@ -1687,10 +1687,7 @@ impl App {
                     .network_approval_context
                     .clone()
                     .and_then(convert_via_json);
-                let additional_permissions = params
-                    .additional_permissions
-                    .clone()
-                    .and_then(convert_via_json);
+                let additional_permissions = params.additional_permissions.clone().map(Into::into);
                 let proposed_execpolicy_amendment = params
                     .proposed_execpolicy_amendment
                     .clone()
@@ -1785,10 +1782,7 @@ impl App {
                     thread_label,
                     call_id: params.item_id.clone(),
                     reason: params.reason.clone(),
-                    permissions: serde_json::from_value(
-                        serde_json::to_value(&params.permissions).ok()?,
-                    )
-                    .ok()?,
+                    permissions: params.permissions.clone().into(),
                 }),
             ),
             _ => None,
@@ -5936,8 +5930,6 @@ mod tests {
     use crate::multi_agents::AgentPickerThreadEntry;
     use assert_matches::assert_matches;
 
-    use codex_app_server_protocol::AdditionalNetworkPermissions;
-    use codex_app_server_protocol::AdditionalPermissionProfile;
     use codex_app_server_protocol::AgentMessageDeltaNotification;
     use codex_app_server_protocol::CommandExecutionRequestApprovalParams;
     use codex_app_server_protocol::ConfigWarningNotification;
@@ -5957,6 +5949,7 @@ mod tests {
     use codex_app_server_protocol::NetworkPolicyAmendment as AppServerNetworkPolicyAmendment;
     use codex_app_server_protocol::NetworkPolicyRuleAction as AppServerNetworkPolicyRuleAction;
     use codex_app_server_protocol::NonSteerableTurnKind as AppServerNonSteerableTurnKind;
+    use codex_app_server_protocol::PermissionsRequestApprovalParams;
     use codex_app_server_protocol::RequestId as AppServerRequestId;
     use codex_app_server_protocol::ServerNotification;
     use codex_app_server_protocol::ServerRequest;
@@ -5983,8 +5976,6 @@ mod tests {
     use codex_protocol::config_types::ModeKind;
     use codex_protocol::config_types::Settings;
     use codex_protocol::mcp::Tool;
-    use codex_protocol::models::NetworkPermissions;
-    use codex_protocol::models::PermissionProfile;
     use codex_protocol::openai_models::ModelAvailabilityNux;
     use codex_protocol::protocol::AskForApproval;
     use codex_protocol::protocol::Event;
@@ -5998,6 +5989,7 @@ mod tests {
     use codex_protocol::protocol::SessionConfiguredEvent;
     use codex_protocol::protocol::SessionSource;
     use codex_protocol::protocol::TurnContextItem;
+    use codex_protocol::request_permissions::RequestPermissionProfile as CoreRequestPermissionProfile;
     use codex_protocol::user_input::TextElement;
     use codex_protocol::user_input::UserInput;
     use crossterm::event::KeyModifiers;
@@ -8089,12 +8081,13 @@ guardian_approval = true
             host: "example.com".to_string(),
             protocol: AppServerNetworkApprovalProtocol::Https,
         });
-        params.additional_permissions = Some(AdditionalPermissionProfile {
-            network: Some(AdditionalNetworkPermissions {
-                enabled: Some(true),
-            }),
-            file_system: None,
-        });
+        params.additional_permissions = Some(
+            serde_json::from_value(serde_json::json!({
+                "network": { "enabled": true },
+                "fileSystem": { "write": ["/tmp/repo/.git"] }
+            }))
+            .expect("valid additional permissions"),
+        );
         params.proposed_network_policy_amendments = Some(vec![AppServerNetworkPolicyAmendment {
             host: "example.com".to_string(),
             action: AppServerNetworkPolicyRuleAction::Allow,
@@ -8121,12 +8114,13 @@ guardian_approval = true
         );
         assert_eq!(
             additional_permissions,
-            Some(PermissionProfile {
-                network: Some(NetworkPermissions {
-                    enabled: Some(true),
-                }),
-                file_system: None,
-            })
+            Some(
+                serde_json::from_value(serde_json::json!({
+                    "network": { "enabled": true },
+                    "file_system": { "write": ["/tmp/repo/.git"] }
+                }))
+                .expect("valid core permissions"),
+            )
         );
         assert_eq!(
             available_decisions,
@@ -8141,6 +8135,47 @@ guardian_approval = true
                 },
                 codex_protocol::protocol::ReviewDecision::Abort,
             ]
+        );
+    }
+
+    #[tokio::test]
+    async fn inactive_thread_permissions_request_preserves_requested_paths() {
+        let app = make_test_app().await;
+        let thread_id = ThreadId::new();
+        let request = ServerRequest::PermissionsRequestApproval {
+            request_id: AppServerRequestId::Integer(7),
+            params: PermissionsRequestApprovalParams {
+                thread_id: thread_id.to_string(),
+                turn_id: "turn-approval".to_string(),
+                item_id: "perm-1".to_string(),
+                reason: Some("Need git metadata access".to_string()),
+                permissions: serde_json::from_value(serde_json::json!({
+                    "fileSystem": { "write": ["/tmp/repo/.git"] }
+                }))
+                .expect("valid permissions"),
+            },
+        };
+
+        let Some(ThreadInteractiveRequest::Approval(ApprovalRequest::Permissions {
+            call_id,
+            reason,
+            permissions,
+            ..
+        })) = app
+            .interactive_request_for_thread_request(thread_id, &request)
+            .await
+        else {
+            panic!("expected permissions approval request");
+        };
+
+        assert_eq!(call_id, "perm-1");
+        assert_eq!(reason, Some("Need git metadata access".to_string()));
+        assert_eq!(
+            permissions,
+            serde_json::from_value::<CoreRequestPermissionProfile>(serde_json::json!({
+                "file_system": { "write": ["/tmp/repo/.git"] }
+            }))
+            .expect("valid core permissions")
         );
     }
 

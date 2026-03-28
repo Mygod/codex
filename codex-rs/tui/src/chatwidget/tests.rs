@@ -21,6 +21,8 @@ use crate::test_support::PathBufExt;
 use crate::test_support::test_path_display;
 use crate::tui::FrameRequester;
 use assert_matches::assert_matches;
+use codex_app_server_protocol::AdditionalFileSystemPermissions;
+use codex_app_server_protocol::AdditionalPermissionProfile as AppServerAdditionalPermissionProfile;
 use codex_app_server_protocol::AppSummary;
 use codex_app_server_protocol::CollabAgentState as AppServerCollabAgentState;
 use codex_app_server_protocol::CollabAgentStatus as AppServerCollabAgentStatus;
@@ -54,6 +56,7 @@ use codex_app_server_protocol::McpServerStartupState;
 use codex_app_server_protocol::McpServerStatusUpdatedNotification;
 use codex_app_server_protocol::PatchApplyStatus as AppServerPatchApplyStatus;
 use codex_app_server_protocol::PatchChangeKind;
+use codex_app_server_protocol::PermissionsRequestApprovalParams as AppServerPermissionsRequestApprovalParams;
 use codex_app_server_protocol::PluginAuthPolicy;
 use codex_app_server_protocol::PluginDetail;
 use codex_app_server_protocol::PluginInstallPolicy;
@@ -64,6 +67,7 @@ use codex_app_server_protocol::PluginReadResponse;
 use codex_app_server_protocol::PluginSource;
 use codex_app_server_protocol::PluginSummary;
 use codex_app_server_protocol::ReasoningSummaryTextDeltaNotification;
+use codex_app_server_protocol::RequestPermissionProfile as AppServerRequestPermissionProfile;
 use codex_app_server_protocol::ServerNotification;
 use codex_app_server_protocol::SkillSummary;
 use codex_app_server_protocol::ThreadClosedNotification;
@@ -108,7 +112,9 @@ use codex_protocol::items::AgentMessageItem;
 use codex_protocol::items::PlanItem;
 use codex_protocol::items::TurnItem;
 use codex_protocol::items::UserMessageItem;
+use codex_protocol::models::FileSystemPermissions;
 use codex_protocol::models::MessagePhase;
+use codex_protocol::models::PermissionProfile;
 use codex_protocol::openai_models::ModelPreset;
 use codex_protocol::openai_models::ReasoningEffortPreset;
 use codex_protocol::openai_models::default_input_modalities;
@@ -3624,6 +3630,74 @@ fn app_server_exec_approval_request_splits_shell_wrapped_command() {
             "-lc".to_string(),
             script.to_string(),
         ]
+    );
+}
+
+#[test]
+fn app_server_exec_approval_request_preserves_additional_permissions() {
+    let write_path =
+        AbsolutePathBuf::try_from(PathBuf::from("/tmp/approval-write.txt")).expect("absolute");
+    let request =
+        exec_approval_request_from_params(AppServerCommandExecutionRequestApprovalParams {
+            thread_id: "thread-1".to_string(),
+            turn_id: "turn-1".to_string(),
+            item_id: "item-1".to_string(),
+            approval_id: Some("approval-1".to_string()),
+            reason: None,
+            network_approval_context: None,
+            command: Some("git add file.txt".to_string()),
+            cwd: Some(PathBuf::from("/tmp")),
+            command_actions: None,
+            additional_permissions: Some(AppServerAdditionalPermissionProfile {
+                network: None,
+                file_system: Some(AdditionalFileSystemPermissions {
+                    read: None,
+                    write: Some(vec![write_path.clone()]),
+                }),
+            }),
+            proposed_execpolicy_amendment: None,
+            proposed_network_policy_amendments: None,
+            available_decisions: None,
+        });
+
+    assert_eq!(
+        request.additional_permissions,
+        Some(PermissionProfile {
+            network: None,
+            file_system: Some(FileSystemPermissions {
+                read: None,
+                write: Some(vec![write_path]),
+            }),
+        })
+    );
+}
+
+#[test]
+fn app_server_request_permissions_preserves_requested_paths() {
+    let write_path = AbsolutePathBuf::try_from(PathBuf::from("/tmp/repo/.git")).expect("absolute");
+    let event = request_permissions_from_params(AppServerPermissionsRequestApprovalParams {
+        thread_id: "thread-1".to_string(),
+        turn_id: "turn-1".to_string(),
+        item_id: "call-1".to_string(),
+        reason: Some("Need git metadata access".to_string()),
+        permissions: AppServerRequestPermissionProfile {
+            network: None,
+            file_system: Some(AdditionalFileSystemPermissions {
+                read: None,
+                write: Some(vec![write_path.clone()]),
+            }),
+        },
+    });
+
+    assert_eq!(
+        event.permissions,
+        codex_protocol::request_permissions::RequestPermissionProfile {
+            network: None,
+            file_system: Some(FileSystemPermissions {
+                read: None,
+                write: Some(vec![write_path]),
+            }),
+        }
     );
 }
 

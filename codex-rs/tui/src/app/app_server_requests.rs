@@ -153,14 +153,10 @@ impl PendingAppServerRequests {
                     Ok::<AppServerRequestResolution, String>(AppServerRequestResolution {
                         request_id,
                         result: serde_json::to_value(PermissionsRequestApprovalResponse {
-                            permissions: serde_json::from_value::<GrantedPermissionProfile>(
-                                serde_json::to_value(&response.permissions).map_err(|err| {
-                                    format!("failed to encode granted permissions: {err}")
-                                })?,
-                            )
-                            .map_err(|err| {
-                                format!("failed to decode granted permissions for app-server: {err}")
-                            })?,
+                            permissions: GrantedPermissionProfile {
+                                network: response.permissions.network.clone().map(Into::into),
+                                file_system: response.permissions.file_system.clone().map(Into::into),
+                            },
                             scope: response.scope.into(),
                         })
                         .map_err(|err| {
@@ -349,7 +345,8 @@ mod tests {
                     item_id: "perm-1".to_string(),
                     reason: None,
                     permissions: serde_json::from_value(json!({
-                        "network": { "enabled": null }
+                        "network": { "enabled": null },
+                        "fileSystem": { "write": ["/tmp/repo/.git"] }
                     }))
                     .expect("valid permissions"),
                 },
@@ -374,7 +371,8 @@ mod tests {
                 id: "perm-1".to_string(),
                 response: codex_protocol::request_permissions::RequestPermissionsResponse {
                     permissions: serde_json::from_value(json!({
-                        "network": { "enabled": null }
+                        "network": { "enabled": null },
+                        "file_system": { "write": ["/tmp/repo/.git"] }
                     }))
                     .expect("valid permissions"),
                     scope: codex_protocol::request_permissions::PermissionGrantScope::Session,
@@ -388,7 +386,8 @@ mod tests {
                 .expect("permissions response should decode"),
             PermissionsRequestApprovalResponse {
                 permissions: serde_json::from_value(json!({
-                    "network": { "enabled": null }
+                    "network": { "enabled": null },
+                    "fileSystem": { "write": ["/tmp/repo/.git"] }
                 }))
                 .expect("valid permissions"),
                 scope: PermissionGrantScope::Session,
