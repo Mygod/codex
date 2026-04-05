@@ -498,9 +498,6 @@ fn run_read_acl_only(payload: &Payload, log: &mut File) -> Result<()> {
             log,
             &format!("read ACL run completed with errors: {:?}", refresh_errors),
         )?;
-        if payload.refresh_only {
-            anyhow::bail!("read ACL run had errors");
-        }
     }
     log_line(log, "read ACL run completed")?;
     Ok(())
@@ -897,7 +894,6 @@ fn run_setup_full(payload: &Payload, log: &mut File, sbx_dir: &Path) -> Result<(
             log,
             &format!("setup refresh completed with errors: {:?}", refresh_errors),
         )?;
-        anyhow::bail!("setup refresh had errors");
     }
     log_note("setup binary completed", Some(sbx_dir));
     Ok(())

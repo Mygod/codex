@@ -16,6 +16,7 @@ use crate::helper_materialization::helper_bin_dir;
 use crate::logging::log_note;
 use crate::path_normalization::canonical_path_key;
 use crate::policy::SandboxPolicy;
+use crate::read_acl_mutex::acquire_setup_refresh_mutex;
 use crate::setup_error::SetupErrorCode;
 use crate::setup_error::SetupFailure;
 use crate::setup_error::clear_setup_error_report;
@@ -153,6 +154,16 @@ fn run_setup_refresh_inner(
     ) {
         return Ok(());
     }
+    let _refresh_guard = match acquire_setup_refresh_mutex()? {
+        Some(guard) => guard,
+        None => {
+            log_note(
+                "setup refresh: another refresh is already in progress; skipping",
+                Some(&sandbox_dir(request.codex_home)),
+            );
+            return Ok(());
+        }
+    };
     let (read_roots, write_roots) = build_payload_roots(&request, overrides);
     let network_identity =
         SandboxNetworkIdentity::from_policy(request.policy, request.proxy_enforced);

@@ -23,6 +23,7 @@ windows_modules!(
     path_normalization,
     policy,
     process,
+    read_acl_mutex,
     token,
     winutil,
     workspace_acl
