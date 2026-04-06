@@ -114,6 +114,85 @@ fn log_line(log: &mut File, msg: &str) -> Result<()> {
     Ok(())
 }
 
+struct WriteRootDiagnosticPsids {
+    users_psid: Option<*mut c_void>,
+    auth_psid: Option<*mut c_void>,
+    everyone_psid: Option<*mut c_void>,
+}
+
+fn maybe_load_diagnostic_psid(log: &mut File, name: &str) -> Option<*mut c_void> {
+    match resolve_sid(name).and_then(|sid| sid_bytes_to_psid(&sid)) {
+        Ok(psid) => Some(psid),
+        Err(err) => {
+            let _ = log_line(
+                log,
+                &format!("write root diagnostics: resolving PSID for {name} failed: {err}"),
+            );
+            None
+        }
+    }
+}
+
+fn write_mask_probe_label(
+    root: &Path,
+    label: &str,
+    psid: Option<*mut c_void>,
+    write_mask: u32,
+) -> String {
+    match psid {
+        Some(psid) => {
+            match path_mask_allows(root, &[psid], write_mask, /*require_all_bits*/ true) {
+                Ok(true) => format!("{label}=allow"),
+                Ok(false) => format!("{label}=deny"),
+                Err(err) => format!("{label}=error({err})"),
+            }
+        }
+        None => format!("{label}=unavailable"),
+    }
+}
+
+fn log_write_root_diagnostics(
+    log: &mut File,
+    root: &Path,
+    is_command_cwd: bool,
+    cap_label: &str,
+    cap_psid_for_root: *mut c_void,
+    sandbox_group_psid: *mut c_void,
+    diagnostic_psids: &WriteRootDiagnosticPsids,
+    write_mask: u32,
+) -> Result<()> {
+    let details = [
+        write_mask_probe_label(root, "users", diagnostic_psids.users_psid, write_mask),
+        write_mask_probe_label(
+            root,
+            "authenticated_users",
+            diagnostic_psids.auth_psid,
+            write_mask,
+        ),
+        write_mask_probe_label(root, "everyone", diagnostic_psids.everyone_psid, write_mask),
+        write_mask_probe_label(root, "sandbox_group", Some(sandbox_group_psid), write_mask),
+        write_mask_probe_label(root, cap_label, Some(cap_psid_for_root), write_mask),
+    ]
+    .join(", ");
+    log_line(
+        log,
+        &format!(
+            "write root diagnostics for {} (is_command_cwd={is_command_cwd}, write_mask=0x{write_mask:x}): {details}",
+            root.display()
+        ),
+    )
+}
+
+fn free_optional_psid(psid: Option<*mut c_void>) {
+    if let Some(psid) = psid
+        && !psid.is_null()
+    {
+        unsafe {
+            LocalFree(psid as HLOCAL);
+        }
+    }
+}
+
 fn spawn_read_acl_helper(payload: &Payload, _log: &mut File) -> Result<()> {
     let mut read_payload = payload.clone();
     read_payload.mode = SetupMode::ReadAclsOnly;
@@ -573,6 +652,11 @@ fn run_setup_full(payload: &Payload, log: &mut File, sbx_dir: &Path) -> Result<(
         convert_string_sid_to_sid(&workspace_sid_str)
             .ok_or_else(|| anyhow::anyhow!("convert workspace capability SID failed"))?
     };
+    let diagnostic_psids = WriteRootDiagnosticPsids {
+        users_psid: maybe_load_diagnostic_psid(log, "Users"),
+        auth_psid: maybe_load_diagnostic_psid(log, "Authenticated Users"),
+        everyone_psid: maybe_load_diagnostic_psid(log, "Everyone"),
+    };
     let mut refresh_errors: Vec<String> = Vec::new();
     if !refresh_only {
         let proxy_allowlist_result = firewall::ensure_offline_proxy_allowlist(
@@ -656,6 +740,7 @@ fn run_setup_full(payload: &Payload, log: &mut File, sbx_dir: &Path) -> Result<(
             continue;
         }
         let mut need_grant = false;
+        let mut had_check_error = false;
         let is_command_cwd = is_command_cwd_root(root, &canonical_command_cwd);
         let cap_label = if is_command_cwd {
             "workspace_cap"
@@ -675,6 +760,7 @@ fn run_setup_full(payload: &Payload, log: &mut File, sbx_dir: &Path) -> Result<(
                 match path_mask_allows(root, &[psid], write_mask, /*require_all_bits*/ true) {
                     Ok(h) => h,
                     Err(e) => {
+                        had_check_error = true;
                         refresh_errors.push(format!(
                             "write mask check failed on {} for {label}: {}",
                             root.display(),
@@ -694,6 +780,18 @@ fn run_setup_full(payload: &Payload, log: &mut File, sbx_dir: &Path) -> Result<(
             if !has {
                 need_grant = true;
             }
+        }
+        if need_grant || had_check_error {
+            log_write_root_diagnostics(
+                log,
+                root,
+                is_command_cwd,
+                cap_label,
+                cap_psid_for_root,
+                sandbox_group_psid,
+                &diagnostic_psids,
+                write_mask,
+            )?;
         }
         if need_grant {
             log_line(
@@ -744,7 +842,28 @@ fn run_setup_full(payload: &Payload, log: &mut File, sbx_dir: &Path) -> Result<(
             match res {
                 Ok(_) => {}
                 Err(e) => {
+                    let is_command_cwd = is_command_cwd_root(&root, &canonical_command_cwd);
+                    let cap_label = if is_command_cwd {
+                        "workspace_cap"
+                    } else {
+                        "cap"
+                    };
+                    let cap_psid_for_root = if is_command_cwd {
+                        workspace_psid
+                    } else {
+                        cap_psid
+                    };
                     refresh_errors.push(format!("write ACE failed on {}: {}", root.display(), e));
+                    let _ = log_write_root_diagnostics(
+                        log,
+                        &root,
+                        is_command_cwd,
+                        cap_label,
+                        cap_psid_for_root,
+                        sandbox_group_psid,
+                        &diagnostic_psids,
+                        write_mask,
+                    );
                     if log_line(
                         log,
                         &format!("write ACE grant failed on {}: {}", root.display(), e),
@@ -889,6 +1008,9 @@ fn run_setup_full(payload: &Payload, log: &mut File, sbx_dir: &Path) -> Result<(
             LocalFree(workspace_psid as HLOCAL);
         }
     }
+    free_optional_psid(diagnostic_psids.users_psid);
+    free_optional_psid(diagnostic_psids.auth_psid);
+    free_optional_psid(diagnostic_psids.everyone_psid);
     if refresh_only && !refresh_errors.is_empty() {
         log_line(
             log,

@@ -4,6 +4,7 @@ use anyhow::Result;
 use std::ffi::c_void;
 use std::path::Path;
 use windows_sys::Win32::Foundation::CloseHandle;
+use windows_sys::Win32::Foundation::GetLastError;
 use windows_sys::Win32::Foundation::LocalFree;
 use windows_sys::Win32::Foundation::ERROR_SUCCESS;
 use windows_sys::Win32::Foundation::HLOCAL;
@@ -57,17 +58,22 @@ const DENY_ACCESS: i32 = 3;
 /// Caller must free the returned security descriptor with `LocalFree` and pass an existing path.
 pub unsafe fn fetch_dacl_handle(path: &Path) -> Result<(*mut ACL, *mut c_void)> {
     let wpath = to_wide(path);
+    let share_mode = FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE;
     let h = CreateFileW(
         wpath.as_ptr(),
         READ_CONTROL,
-        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        share_mode,
         std::ptr::null_mut(),
         OPEN_EXISTING,
         FILE_FLAG_BACKUP_SEMANTICS,
         0,
     );
     if h == INVALID_HANDLE_VALUE {
-        return Err(anyhow!("CreateFileW failed for {}", path.display()));
+        let err = GetLastError();
+        return Err(anyhow!(
+            "CreateFileW(READ_CONTROL, share=0x{share_mode:x}) failed for {}: {err}",
+            path.display()
+        ));
     }
     let mut p_sd: *mut c_void = std::ptr::null_mut();
     let mut p_dacl: *mut ACL = std::ptr::null_mut();
@@ -84,9 +90,8 @@ pub unsafe fn fetch_dacl_handle(path: &Path) -> Result<(*mut ACL, *mut c_void)> 
     CloseHandle(h);
     if code != ERROR_SUCCESS {
         return Err(anyhow!(
-            "GetSecurityInfo failed for {}: {}",
+            "GetSecurityInfo(DACL_SECURITY_INFORMATION) failed for {}: {code}",
             path.display(),
-            code
         ));
     }
     Ok((p_dacl, p_sd))
@@ -327,13 +332,22 @@ unsafe fn ensure_allow_mask_aces_with_inheritance_impl(
                 if !p_sd.is_null() {
                     LocalFree(p_sd as HLOCAL);
                 }
-                return Err(anyhow!("SetNamedSecurityInfoW failed: {}", code3));
+                return Err(anyhow!(
+                    "SetNamedSecurityInfoW(DACL_SECURITY_INFORMATION) failed for {} \
+                     (allow_mask=0x{allow_mask:x}, inheritance=0x{inheritance:x}, sid_count={}): {code3}",
+                    path.display(),
+                    sids.len()
+                ));
             }
         } else {
             if !p_sd.is_null() {
                 LocalFree(p_sd as HLOCAL);
             }
-            return Err(anyhow!("SetEntriesInAclW failed: {}", code2));
+            return Err(anyhow!(
+                "SetEntriesInAclW failed for {} (allow_mask=0x{allow_mask:x}, inheritance=0x{inheritance:x}, sid_count={}): {code2}",
+                path.display(),
+                sids.len()
+            ));
         }
     }
     if !p_sd.is_null() {
