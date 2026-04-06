@@ -7,14 +7,23 @@ on:
       - fix-windows
 
 jobs:
-  build-windows:
+  build-windows-binaries:
+    name: Build Windows binaries - ${{ matrix.bundle }}
     runs-on: windows-latest
-    timeout-minutes: 60
+    timeout-minutes: 120
     permissions:
       contents: read
     defaults:
       run:
         working-directory: codex-rs
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - bundle: primary
+            build_args: --bin codex --bin codex-responses-api-proxy
+          - bundle: helpers
+            build_args: --bin codex-windows-sandbox-setup --bin codex-command-runner
 
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
@@ -23,17 +32,74 @@ jobs:
         with:
           targets: x86_64-pc-windows-msvc
 
-      - name: Cargo build
+      - name: Cargo build (Windows binaries)
         shell: bash
         run: |
-          cargo build --target x86_64-pc-windows-msvc --release \
-            --bin codex \
-            --bin codex-responses-api-proxy \
-            --bin codex-windows-sandbox-setup \
-            --bin codex-command-runner
+          cargo build --target x86_64-pc-windows-msvc --release --timings ${{ matrix.build_args }}
+
+      - name: Upload Cargo timings
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7
+        with:
+          name: cargo-timings-windows-patch-build-${{ matrix.bundle }}
+          path: codex-rs/target/**/cargo-timings/cargo-timing.html
+          if-no-files-found: warn
+
+      - name: Stage Windows binaries
+        shell: bash
+        run: |
+          output_dir="target/x86_64-pc-windows-msvc/release/staged-${{ matrix.bundle }}"
+          mkdir -p "$output_dir"
+          if [[ "${{ matrix.bundle }}" == "primary" ]]; then
+            cp target/x86_64-pc-windows-msvc/release/codex.exe "$output_dir/codex.exe"
+            cp target/x86_64-pc-windows-msvc/release/codex-responses-api-proxy.exe "$output_dir/codex-responses-api-proxy.exe"
+          else
+            cp target/x86_64-pc-windows-msvc/release/codex-windows-sandbox-setup.exe "$output_dir/codex-windows-sandbox-setup.exe"
+            cp target/x86_64-pc-windows-msvc/release/codex-command-runner.exe "$output_dir/codex-command-runner.exe"
+          fi
+
+      - name: Upload Windows binaries
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7
+        with:
+          name: windows-binaries-x86_64-pc-windows-msvc-${{ matrix.bundle }}
+          path: codex-rs/target/x86_64-pc-windows-msvc/release/staged-${{ matrix.bundle }}/*
+
+  stage-windows-artifacts:
+    name: Stage Windows patch artifacts
+    needs:
+      - build-windows-binaries
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+
+      - name: Download prebuilt Windows primary binaries
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: windows-binaries-x86_64-pc-windows-msvc-primary
+          path: codex-rs/target/x86_64-pc-windows-msvc/release
+
+      - name: Download prebuilt Windows helper binaries
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: windows-binaries-x86_64-pc-windows-msvc-helpers
+          path: codex-rs/target/x86_64-pc-windows-msvc/release
+
+      - name: Verify binaries
+        shell: bash
+        working-directory: codex-rs
+        run: |
+          set -euo pipefail
+          ls -lh target/x86_64-pc-windows-msvc/release/codex.exe
+          ls -lh target/x86_64-pc-windows-msvc/release/codex-responses-api-proxy.exe
+          ls -lh target/x86_64-pc-windows-msvc/release/codex-windows-sandbox-setup.exe
+          ls -lh target/x86_64-pc-windows-msvc/release/codex-command-runner.exe
 
       - name: Stage artifacts
         shell: bash
+        working-directory: codex-rs
         run: |
           dest="dist/x86_64-pc-windows-msvc"
           mkdir -p "$dest"
