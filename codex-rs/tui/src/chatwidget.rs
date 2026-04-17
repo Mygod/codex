@@ -4663,6 +4663,9 @@ impl ChatWidget {
 
     pub(crate) fn handle_request_permissions_now(&mut self, ev: RequestPermissionsEvent) {
         self.flush_answer_stream_with_separator();
+        self.notify(Notification::PermissionsApprovalRequested {
+            reason: ev.reason.clone(),
+        });
         let request = ApprovalRequest::Permissions {
             thread_id: self.thread_id.unwrap_or_default(),
             thread_label: None,
@@ -10777,6 +10780,7 @@ enum Notification {
     ExecApprovalRequested { command: String },
     EditApprovalRequested { cwd: PathBuf, changes: Vec<PathBuf> },
     ElicitationRequested { server_name: String },
+    PermissionsApprovalRequested { reason: Option<String> },
     PlanModePrompt { title: String },
 }
 
@@ -10807,6 +10811,15 @@ impl Notification {
             Notification::ElicitationRequested { server_name } => {
                 format!("Approval requested by {server_name}")
             }
+            Notification::PermissionsApprovalRequested { reason } => match reason.as_deref() {
+                Some(reason) if !reason.trim().is_empty() => {
+                    format!(
+                        "Approval requested: {}",
+                        truncate_text(reason.trim(), /*max_graphemes*/ 30)
+                    )
+                }
+                _ => "Approval requested: additional permissions".to_string(),
+            },
             Notification::PlanModePrompt { title } => {
                 format!("Plan mode prompt: {title}")
             }
@@ -10818,7 +10831,8 @@ impl Notification {
             Notification::AgentTurnComplete { .. } => "agent-turn-complete",
             Notification::ExecApprovalRequested { .. }
             | Notification::EditApprovalRequested { .. }
-            | Notification::ElicitationRequested { .. } => "approval-requested",
+            | Notification::ElicitationRequested { .. }
+            | Notification::PermissionsApprovalRequested { .. } => "approval-requested",
             Notification::PlanModePrompt { .. } => "plan-mode-prompt",
         }
     }
@@ -10829,6 +10843,7 @@ impl Notification {
             Notification::ExecApprovalRequested { .. }
             | Notification::EditApprovalRequested { .. }
             | Notification::ElicitationRequested { .. }
+            | Notification::PermissionsApprovalRequested { .. }
             | Notification::PlanModePrompt { .. } => 1,
         }
     }

@@ -1,6 +1,85 @@
 use super::*;
 use pretty_assertions::assert_eq;
 
+#[test]
+fn request_permissions_notification_uses_approval_requested_type_name() {
+    let notification = Notification::PermissionsApprovalRequested {
+        reason: Some("Need network to run the requested command".to_string()),
+    };
+
+    assert!(notification.allowed_for(&Notifications::Custom(vec![
+        "approval-requested".to_string(),
+    ])));
+    assert!(!notification.allowed_for(&Notifications::Custom(vec![
+        "plan-mode-prompt".to_string(),
+    ])));
+    assert_eq!(
+        notification.display(),
+        "Approval requested: Need network to run the req..."
+    );
+}
+
+#[test]
+fn request_permissions_notification_falls_back_when_reason_is_missing() {
+    let notification = Notification::PermissionsApprovalRequested { reason: None };
+
+    assert_eq!(
+        notification.display(),
+        "Approval requested: additional permissions"
+    );
+}
+
+#[tokio::test]
+async fn handle_request_permissions_sets_pending_notification() {
+    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+    chat.config.tui_notifications.notifications =
+        Notifications::Custom(vec!["approval-requested".to_string()]);
+
+    chat.handle_request_permissions_now(RequestPermissionsEvent {
+        call_id: "call-1".to_string(),
+        turn_id: "turn-1".to_string(),
+        reason: Some("Need network to run the requested command".to_string()),
+        permissions: RequestPermissionProfile {
+            network: Some(NetworkPermissions {
+                enabled: Some(true),
+            }),
+            file_system: None,
+        },
+    });
+
+    assert_matches!(
+        chat.pending_notification,
+        Some(Notification::PermissionsApprovalRequested { ref reason })
+            if reason.as_deref() == Some("Need network to run the requested command")
+    );
+}
+
+#[tokio::test]
+async fn request_permissions_notification_overrides_pending_agent_turn_complete_notification() {
+    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+
+    chat.notify(Notification::AgentTurnComplete {
+        response: "done".to_string(),
+    });
+    chat.handle_request_permissions_now(RequestPermissionsEvent {
+        call_id: "call-1".to_string(),
+        turn_id: "turn-1".to_string(),
+        reason: Some("Need network to run the requested command".to_string()),
+        permissions: RequestPermissionProfile {
+            network: Some(NetworkPermissions {
+                enabled: Some(true),
+            }),
+            file_system: None,
+        },
+    });
+
+    assert_matches!(
+        chat.pending_notification,
+        Some(Notification::PermissionsApprovalRequested { ref reason })
+            if reason.as_deref() == Some("Need network to run the requested command")
+    );
+}
+
 #[tokio::test]
 async fn approvals_selection_popup_snapshot() {
     let (mut chat, _rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
